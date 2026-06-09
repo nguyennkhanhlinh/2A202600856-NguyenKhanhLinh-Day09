@@ -41,9 +41,11 @@ class LawState(TypedDict):
     law_analysis: str
     needs_tax: bool
     needs_compliance: bool
+    needs_privacy: bool
     # Annotated so parallel branches can both write without conflict
     tax_result: Annotated[str, _last_wins]
     compliance_result: Annotated[str, _last_wins]
+    privacy_result: Annotated[str, _last_wins]
     final_answer: str
 
 
@@ -77,7 +79,7 @@ async def check_routing(state: LawState) -> dict:
     depth = state.get("delegation_depth", 0)
     if depth >= MAX_DELEGATION_DEPTH:
         logger.info("Max delegation depth reached (%d); skipping sub-agents", depth)
-        return {"needs_tax": False, "needs_compliance": False}
+        return {"needs_tax": False, "needs_compliance": False, "needs_privacy": False}
 
     llm = get_llm()
     messages = [
@@ -86,9 +88,10 @@ async def check_routing(state: LawState) -> dict:
                 'You are a legal routing expert. Based on the question, decide whether '
                 'specialist sub-agents are needed.\n'
                 'Reply with ONLY valid JSON — no markdown, no extra text:\n'
-                '{"needs_tax": <true|false>, "needs_compliance": <true|false>}\n\n'
+                '{"needs_tax": <true|false>, "needs_compliance": <true|false>, "needs_privacy": <true|false>}\n\n'
                 'needs_tax = true  → question involves tax law, IRS, tax evasion, penalties\n'
-                'needs_compliance = true → question involves regulatory compliance, SEC, SOX, AML, FCPA'
+                'needs_compliance = true → question involves regulatory compliance, SEC, SOX, AML, FCPA\n'
+                'needs_privacy = true → question involves data protection, privacy, GDPR, CCPA, data breach'
             )
         ),
         HumanMessage(content=state["question"]),
@@ -106,13 +109,21 @@ async def check_routing(state: LawState) -> dict:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("Routing LLM returned non-JSON: %r — defaulting to both=True", raw)
-        parsed = {"needs_tax": True, "needs_compliance": True}
+        logger.warning("Routing LLM returned non-JSON: %r — defaulting to all=True", raw)
+        parsed = {"needs_tax": True, "needs_compliance": True, "needs_privacy": True}
 
     needs_tax = bool(parsed.get("needs_tax", True))
     needs_compliance = bool(parsed.get("needs_compliance", True))
-    logger.info("Routing decision: needs_tax=%s needs_compliance=%s", needs_tax, needs_compliance)
-    return {"needs_tax": needs_tax, "needs_compliance": needs_compliance}
+    needs_privacy = bool(parsed.get("needs_privacy", False))
+    logger.info(
+        "Routing decision: needs_tax=%s needs_compliance=%s needs_privacy=%s",
+        needs_tax, needs_compliance, needs_privacy,
+    )
+    return {
+        "needs_tax": needs_tax,
+        "needs_compliance": needs_compliance,
+        "needs_privacy": needs_privacy,
+    }
 
 
 def route_to_subagents(state: LawState) -> list[Send]:
@@ -126,6 +137,8 @@ def route_to_subagents(state: LawState) -> list[Send]:
         sends.append(Send("call_tax", state))
     if state.get("needs_compliance"):
         sends.append(Send("call_compliance", state))
+    if state.get("needs_privacy"):
+        sends.append(Send("call_privacy", state))
     if not sends:
         # No sub-agents needed — go straight to aggregation
         sends.append(Send("aggregate", state))
@@ -174,6 +187,27 @@ async def call_compliance(state: LawState) -> dict:
         return {"compliance_result": f"[Compliance analysis unavailable: {exc}]"}
 
 
+async def call_privacy(state: LawState) -> dict:
+    """Delegate to the Privacy Agent via A2A."""
+    from common.a2a_client import delegate
+    from common.registry_client import discover
+
+    try:
+        endpoint = await discover("privacy_question")
+        result = await delegate(
+            endpoint=endpoint,
+            question=state["question"],
+            context_id=state["context_id"],
+            trace_id=state["trace_id"],
+            depth=state.get("delegation_depth", 0) + 1,
+        )
+        logger.info("Privacy Agent returned %d chars", len(result))
+        return {"privacy_result": result}
+    except Exception as exc:
+        logger.exception("call_privacy failed: %s", exc)
+        return {"privacy_result": f"[Privacy analysis unavailable: {exc}]"}
+
+
 async def aggregate(state: LawState) -> dict:
     """Combine law_analysis, tax_result, and compliance_result into a final answer."""
     llm = get_llm()
@@ -185,6 +219,8 @@ async def aggregate(state: LawState) -> dict:
         sections.append(f"## Tax Analysis\n{state['tax_result']}")
     if state.get("compliance_result"):
         sections.append(f"## Regulatory Compliance Analysis\n{state['compliance_result']}")
+    if state.get("privacy_result"):
+        sections.append(f"## Data Protection & Privacy Analysis\n{state['privacy_result']}")
 
     combined = "\n\n---\n\n".join(sections)
 
@@ -216,21 +252,23 @@ def create_graph():
     graph.add_node("check_routing", check_routing)
     graph.add_node("call_tax", call_tax)
     graph.add_node("call_compliance", call_compliance)
+    graph.add_node("call_privacy", call_privacy)
     graph.add_node("aggregate", aggregate)
 
     graph.set_entry_point("analyze_law")
     graph.add_edge("analyze_law", "check_routing")
 
     # Conditional parallel dispatch: after check_routing, route_to_subagents
-    # returns a list of Send objects (to call_tax, call_compliance, or aggregate)
+    # returns a list of Send objects (to call_tax, call_compliance, call_privacy, or aggregate)
     graph.add_conditional_edges(
         "check_routing",
         route_to_subagents,
-        ["call_tax", "call_compliance", "aggregate"],
+        ["call_tax", "call_compliance", "call_privacy", "aggregate"],
     )
 
     graph.add_edge("call_tax", "aggregate")
     graph.add_edge("call_compliance", "aggregate")
+    graph.add_edge("call_privacy", "aggregate")
     graph.add_edge("aggregate", END)
 
     return graph.compile()

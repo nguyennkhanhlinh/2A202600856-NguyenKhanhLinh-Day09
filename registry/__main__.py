@@ -12,12 +12,19 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+# Single source of truth: the port is derived from REGISTRY_URL so that the
+# registry server and all clients (which read REGISTRY_URL) stay in sync.
+REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:10000")
+PORT = urlparse(REGISTRY_URL).port or 10000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,5 +91,5 @@ async def health() -> dict:
 
 
 if __name__ == "__main__":
-    logger.info("Starting Registry on port 10000")
-    uvicorn.run(app, host="0.0.0.0", port=10000, log_level="info")
+    logger.info("Starting Registry on port %d", PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
